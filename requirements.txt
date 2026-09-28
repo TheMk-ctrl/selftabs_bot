@@ -1,0 +1,6 @@
+aiogram==3.17.0
+aiohttp==3.11.18
+aiohttp-socks==0.10.1
+aiocryptopay==1.1.1
+asyncpg==0.30.0
+python-dotenv==1.1.0
