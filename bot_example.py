@@ -25,11 +25,13 @@ bot_example.py — демо-бот Selftabs для прохождения мод
 import asyncio
 import logging
 import os
+import re as _re
 import time
 from typing import Optional
 from urllib.parse import urlencode
 
 import httpx
+from aiohttp import web
 from aiocryptopay import AioCryptoPay, Networks
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -81,11 +83,11 @@ PLANS = {
             "✅ Свой API ключ ИИ\n"
             "✅ Статус-кольцо Pro"
         ),
-        "stars":     245,
+        "stars":     225,
         "usdt":      2.99,
-        "usdt_rub":  290,
-        "sbp_rub":   290,
-        "price_rub": "290 ₽",
+        "usdt_rub":  270,
+        "sbp_rub":   270,
+        "price_rub": "270 ₽",
         "emoji":     "🚀",
     },
     "team": {
@@ -99,9 +101,9 @@ PLANS = {
         ),
         "stars":     770,
         "usdt":      9.99,
-        "usdt_rub":  950,
-        "sbp_rub":   950,
-        "price_rub": "950 ₽",
+        "usdt_rub":  900,
+        "sbp_rub":   900,
+        "price_rub": "900 ₽",
         "emoji":     "🏢",
     },
 }
@@ -265,7 +267,7 @@ async def send_receipt_email(
         logger.error("[EMAIL] Ошибка отправки: %s", exc)
 
 
-# ── Robokassa helpers ─────────────────────────────────────────────────────
+# ── Platega helpers ─────────────────────────────────────────────────────
 
 def _sbp_url(plan_key: str, tg_id: int) -> tuple[str, int]:
     plan   = PLANS[plan_key]
@@ -390,7 +392,6 @@ async def cb_pay_crypto(call: CallbackQuery, state: FSMContext):
 
 # ── Получаем email → переходим к конкретной оплате ───────────────────────
 
-import re as _re
 _EMAIL_RE = _re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -411,7 +412,7 @@ async def handle_email_input(message: Message, state: FSMContext):
     await state.update_data(email=email)
     await state.clear()   # FSM выполнил своё — дальше callback-хендлеры
 
-    plan = PLANS[plan_key]
+    plan  = PLANS[plan_key]
     tg_id = message.from_user.id
 
     # ── Stars ──────────────────────────────────────────────────────────────
@@ -445,7 +446,7 @@ async def handle_email_input(message: Message, state: FSMContext):
                 reply_markup=kb_back_main(),
             )
 
-    # ── СБП (Robokassa) ────────────────────────────────────────────────────
+    # ── СБП (Platega) ────────────────────────────────────────────────────
     elif pay_method == "sbp":
         pay_url, inv_id = _sbp_url(plan_key, tg_id)
         await message.answer(
@@ -584,7 +585,7 @@ async def payment_success(message: Message):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# ОПЛАТА — СБП (Robokassa)
+# ОПЛАТА — СБП (Platega)
 # ══════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data.startswith("check_sbp:"))
@@ -600,7 +601,7 @@ async def check_sbp(call: CallbackQuery):
     await call.answer("🔄 Проверяем оплату...")
 
     # В демо-режиме считаем оплату успешной сразу
-    # В проде здесь нужен запрос к API Robokassa для проверки статуса платежа
+    # В проде здесь нужен запрос к API Platega для проверки статуса платежа
     logger.info("[SBP] DEMO payment confirmed tg=%s plan=%s inv=%s email=%s",
                 tg_id, plan_key, inv_id, email)
 
@@ -618,7 +619,7 @@ async def check_sbp(call: CallbackQuery):
     asyncio.create_task(send_receipt_email(
         to_email=email,
         plan_key=plan_key,
-        payment_method="СБП (Robokassa)",
+        payment_method="СБП (Platega)",
         amount_str=f"{plan.get('sbp_rub')} ₽",
         charge_id=f"SBP-{inv_id}",
     ))
@@ -714,6 +715,23 @@ async def main():
             logger.warning("⚠️ CryptoPay ошибка: %s", e)
     else:
         logger.warning("⚠️ CRYPTO_PAY_TOKEN не задан — крипто-оплата недоступна")
+
+    # ── Health-check сервер для Render ────────────────────────────────────
+    async def health(request):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("✅ Health-check сервер запущен на порту %s", port)
+    # ─────────────────────────────────────────────────────────────────────
 
     print("=" * 55)
     print("🚀 SELFTABS DEMO-БОТ ЗАПУЩЕН (без авторизации)")
