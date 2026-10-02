@@ -83,7 +83,7 @@ PLANS = {
             "✅ Свой API ключ ИИ\n"
             "✅ Статус-кольцо Pro"
         ),
-        "stars":     225,
+        "stars":     245,
         "usdt":      2.99,
         "usdt_rub":  270,
         "sbp_rub":   270,
@@ -129,8 +129,8 @@ crypto: Optional[AioCryptoPay] = None
 
 def kb_main() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🚀 Pro Pass — 290 ₽/мес",       callback_data="plan:pro")
-    builder.button(text="🏢 Team Workspace — 950 ₽/мес", callback_data="plan:team")
+    builder.button(text="🚀 Pro Pass — 270 ₽/мес",       callback_data="plan:pro")
+    builder.button(text="🏢 Team Workspace — 900 ₽/мес", callback_data="plan:team")
     builder.button(text="📋 Сравнить тарифы",             callback_data="plans_info")
     builder.button(text="📩 Поддержка",                   url="https://t.me/selftabs_support")
     builder.adjust(1)
@@ -289,8 +289,8 @@ async def cmd_start(message: Message, state: FSMContext):
         "🌟 <b>Selftabs — умное расширение для браузера</b>\n\n"
         "Сохраняй вкладки, управляй сессиями и получай AI-дайджесты.\n\n"
         "📋 <b>Тарифы:</b>\n"
-        "🚀 <b>Pro Pass</b> — 290 ₽/мес\n"
-        "🏢 <b>Team Workspace</b> — 950 ₽/мес\n\n"
+        "🚀 <b>Pro Pass</b> — 270 ₽/мес\n"
+        "🏢 <b>Team Workspace</b> — 900 ₽/мес\n\n"
         "💳 <b>Способы оплаты:</b>\n"
         "💫 Telegram Stars · 🏦 СБП · 🪙 USDT\n\n"
         f"{LEGAL_LINKS}\n\n"
@@ -727,7 +727,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
 
-    port = int(os.getenv("PORT", 8080))
+    port = int(os.getenv("PORT", 10000))   # Render использует 10000 по умолчанию
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logger.info("✅ Health-check сервер запущен на порту %s", port)
@@ -741,8 +741,44 @@ async def main():
     print(f"🪙 CryptoPay:  {'✅' if CRYPTO_PAY_TOKEN else '❌ не настроен'}")
     print("=" * 55)
 
+    # ── Graceful shutdown при SIGTERM (Render останавливает именно так) ───
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _handle_sigterm():
+        logger.info("SIGTERM получен — начинаем graceful shutdown")
+        stop_event.set()
+
+    import signal
+    loop.add_signal_handler(signal.SIGTERM, _handle_sigterm)
+    loop.add_signal_handler(signal.SIGINT,  _handle_sigterm)
+    # ─────────────────────────────────────────────────────────────────────
+
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+
+    # Запускаем polling в фоне, ждём сигнала остановки
+    polling_task = asyncio.create_task(dp.start_polling(bot))
+    await stop_event.wait()
+
+    # Корректно завершаем всё
+    logger.info("Останавливаем polling...")
+    polling_task.cancel()
+    try:
+        await polling_task
+    except asyncio.CancelledError:
+        pass
+
+    await dp.storage.close()
+    await bot.session.close()
+
+    if crypto:
+        try:
+            await crypto.close()
+        except Exception:
+            pass
+
+    await runner.cleanup()
+    logger.info("✅ Бот остановлен чисто")
 
 
 if __name__ == "__main__":
