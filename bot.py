@@ -1,43 +1,29 @@
 """
 Telegram-бот на aiogram 3.x для расширения Selftabs.
-- Регистрация / вход через FastAPI-бэкенд
-- Привязка Telegram ID к аккаунту
+- Регистрация / вход по Email+пароль прямо в боте (с подтверждением email)
+- Авторизация через deep link из расширения (auth_ токен) — сохранена
+- Привязка Telegram ID к аккаунту — сохранена
 - Оплата подписки через Telegram Stars (XTR) — recurring subscription
 - Оплата подписки через USDT (CryptoPay)
-- Оплата через СБП (ЮКасса)
-
-Режим работы: WEBHOOK (для Render)
-БД: Supabase / PostgreSQL (через asyncpg)
+- Оплата через СБП (Robokassa)
 
 Установка зависимостей:
-    pip install aiogram aiohttp aiocryptopay python-dotenv asyncpg
+    pip install aiogram aiohttp aiocryptopay python-dotenv
 
-Переменные окружения (.env):
-    BOT_TOKEN=...
-    API_URL=...
-    BOT_SECRET=SLFTBS
-    CRYPTO_PAY_TOKEN=...
-    ROBOKASSA_LOGIN=...
-    ROBOKASSA_PASSWORD1=...
-    TELEGRAM_PROXY=          # опционально: socks5://user:pass@host:port
-    NOTIFY_TZ_OFFSET=3
-    NOTIFY_HOUR=20
-    DATABASE_URL=postgresql://user:pass@db.supabase.co:5432/postgres
-    WEBHOOK_URL=https://your-app.onrender.com   # без слеша в конце
-    WEBHOOK_PATH=/webhook
-    PORT=8080
+Запуск:
+    python bot.py
 """
 
 import asyncio
 import logging
 import os
+import sqlite3
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from dotenv import load_dotenv
 import aiohttp
 from aiohttp_socks import ProxyConnector
-from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -52,9 +38,7 @@ from aiogram.types import (
     LabeledPrice, PreCheckoutQuery,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-import asyncpg
 from aiocryptopay import AioCryptoPay, Networks
 
 # ── Конфиг ────────────────────────────────────────────────────────────────
@@ -71,13 +55,11 @@ ROBOKASSA_LOGIN     = os.getenv("ROBOKASSA_LOGIN", "")
 ROBOKASSA_PASSWORD1 = os.getenv("ROBOKASSA_PASSWORD1", "")
 TELEGRAM_PROXY      = os.getenv("TELEGRAM_PROXY", "")
 
+# Platega (СБП + Крипта)
+PLATEGA_BOT_SECRET = os.getenv("BOT_SECRET", "SLFTBS")  # тот же BOT_SECRET
+
 NOTIFY_TZ_OFFSET = int(os.getenv("NOTIFY_TZ_OFFSET", "3"))
 NOTIFY_HOUR      = int(os.getenv("NOTIFY_HOUR", "20"))
-
-DATABASE_URL  = os.getenv("DATABASE_URL")           # postgresql://...
-WEBHOOK_URL   = os.getenv("WEBHOOK_URL", "").rstrip("/")  # https://your-app.onrender.com
-WEBHOOK_PATH  = os.getenv("WEBHOOK_PATH", "/webhook")
-PORT          = int(os.getenv("PORT", "8080"))
 
 # ── Логгер ────────────────────────────────────────────────────────────────
 
@@ -143,31 +125,31 @@ PLAN_NAMES = {
     "team":     ("🏢", "Team Workspace"),
 }
 
-# ── Хранилище токенов (PostgreSQL / Supabase) ─────────────────────────────
+# ── Хранилище токенов (SQLite) ────────────────────────────────────────────
 
 class TokenStorage:
-    """
-    Хранит JWT-токены пользователей в PostgreSQL (Supabase).
-    В памяти держит кэш для быстрых проверок — БД используется
-    только при старте (загрузка) и при изменениях (запись/удаление).
-    """
-
-    def __init__(self):
+    def __init__(self, db_path: str = "bot_tokens.db"):
+        self.db_path = db_path
         self._cache: dict[int, str] = {}
-        self._pool: Optional[asyncpg.Pool] = None
+        self._init_db()
+        self._load_cache()
 
-    async def init(self, pool: asyncpg.Pool):
-        self._pool = pool
-        await pool.execute("""
-            CREATE TABLE IF NOT EXISTS user_tokens (
-                tg_id    BIGINT PRIMARY KEY,
-                token    TEXT NOT NULL,
-                saved_at DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())
-            )
-        """)
-        rows = await pool.fetch("SELECT tg_id, token FROM user_tokens")
-        self._cache = {r["tg_id"]: r["token"] for r in rows}
-        logger.info(f"TokenStorage: загружено {len(self._cache)} сессий из БД")
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_tokens (
+                    tg_id    INTEGER PRIMARY KEY,
+                    token    TEXT NOT NULL,
+                    saved_at REAL DEFAULT (unixepoch())
+                )
+            """)
+            conn.commit()
+
+    def _load_cache(self):
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT tg_id, token FROM user_tokens").fetchall()
+        self._cache = {tg_id: token for tg_id, token in rows}
+        logging.info(f"TokenStorage: загружено {len(self._cache)} сессий из БД")
 
     def __contains__(self, tg_id: int) -> bool:
         return tg_id in self._cache
@@ -175,20 +157,20 @@ class TokenStorage:
     def get(self, tg_id: int, default=None) -> Optional[str]:
         return self._cache.get(tg_id, default)
 
-    async def set(self, tg_id: int, token: str):
+    def __setitem__(self, tg_id: int, token: str):
         self._cache[tg_id] = token
-        await self._pool.execute(
-            """
-            INSERT INTO user_tokens (tg_id, token, saved_at)
-            VALUES ($1, $2, EXTRACT(EPOCH FROM NOW()))
-            ON CONFLICT (tg_id) DO UPDATE SET token = $2, saved_at = EXTRACT(EPOCH FROM NOW())
-            """,
-            tg_id, token,
-        )
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO user_tokens (tg_id, token, saved_at) VALUES (?, ?, unixepoch())",
+                (tg_id, token),
+            )
+            conn.commit()
 
-    async def pop(self, tg_id: int):
+    def pop(self, tg_id: int, *args):
         self._cache.pop(tg_id, None)
-        await self._pool.execute("DELETE FROM user_tokens WHERE tg_id = $1", tg_id)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM user_tokens WHERE tg_id = ?", (tg_id,))
+            conn.commit()
 
     def items(self):
         return list(self._cache.items())
@@ -197,50 +179,49 @@ class TokenStorage:
         return list(self._cache.keys())
 
 
-# ── Лог уведомлений (PostgreSQL / Supabase) ───────────────────────────────
+user_tokens = TokenStorage()
+
+# ── Лог уведомлений ───────────────────────────────────────────────────────
 
 class NotificationLog:
-    def __init__(self):
-        self._pool: Optional[asyncpg.Pool] = None
+    def __init__(self, db_path: str = "bot_tokens.db"):
+        self.db_path = db_path
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS notification_log (
+                    tg_id      INTEGER,
+                    notif_type TEXT,
+                    date_tag   TEXT,
+                    sent_at    REAL DEFAULT (unixepoch()),
+                    PRIMARY KEY (tg_id, notif_type, date_tag)
+                )
+            """)
+            conn.commit()
 
-    async def init(self, pool: asyncpg.Pool):
-        self._pool = pool
-        await pool.execute("""
-            CREATE TABLE IF NOT EXISTS notification_log (
-                tg_id      BIGINT,
-                notif_type TEXT,
-                date_tag   TEXT,
-                sent_at    DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW()),
-                PRIMARY KEY (tg_id, notif_type, date_tag)
-            )
-        """)
-
-    async def already_sent(self, tg_id: int, notif_type: str, date_tag: str) -> bool:
-        row = await self._pool.fetchrow(
-            "SELECT 1 FROM notification_log WHERE tg_id=$1 AND notif_type=$2 AND date_tag=$3",
-            tg_id, notif_type, date_tag,
-        )
+    def already_sent(self, tg_id: int, notif_type: str, date_tag: str) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM notification_log WHERE tg_id=? AND notif_type=? AND date_tag=?",
+                (tg_id, notif_type, date_tag),
+            ).fetchone()
         return row is not None
 
-    async def mark_sent(self, tg_id: int, notif_type: str, date_tag: str):
-        await self._pool.execute(
-            """
-            INSERT INTO notification_log (tg_id, notif_type, date_tag)
-            VALUES ($1, $2, $3)
-            ON CONFLICT DO NOTHING
-            """,
-            tg_id, notif_type, date_tag,
-        )
+    def mark_sent(self, tg_id: int, notif_type: str, date_tag: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO notification_log (tg_id, notif_type, date_tag) VALUES (?,?,?)",
+                (tg_id, notif_type, date_tag),
+            )
+            conn.commit()
 
-    async def cleanup_old(self, days: int = 35):
+    def cleanup_old(self, days: int = 35):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
-        await self._pool.execute(
-            "DELETE FROM notification_log WHERE sent_at < $1", cutoff
-        )
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM notification_log WHERE sent_at < ?", (cutoff,))
+            conn.commit()
 
 
-user_tokens = TokenStorage()
-notif_log   = NotificationLog()
+notif_log = NotificationLog()
 
 # ── FSM-состояния ──────────────────────────────────────────────────────────
 
@@ -252,6 +233,22 @@ class AdminStates(StatesGroup):
     waiting_user_id_sub     = State()
     waiting_sub_plan        = State()
     waiting_sub_days        = State()
+
+
+# ── FSM: Email-авторизация (вход и регистрация) ───────────────────────────
+
+class EmailAuthStates(StatesGroup):
+    # Общий шаг — выбор режима (login/register)
+    choosing_mode   = State()
+    # Вход
+    login_email     = State()
+    login_password  = State()
+    # Регистрация
+    reg_email       = State()
+    reg_password    = State()
+    reg_password2   = State()   # подтверждение пароля
+    # Верификация email (после регистрации)
+    verify_code     = State()   # ожидаем 6-значный код
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -272,8 +269,32 @@ def get_main_keyboard(logged_in: bool, tg_id: int = 0) -> InlineKeyboardMarkup:
             builder.button(text="🛡 Админ-панель", callback_data="admin_panel")
             builder.adjust(2)
     else:
-        builder.button(text="🔑 Войти через расширение", callback_data="login_extension")
+        builder.button(text="📧 Войти / Зарегистрироваться", callback_data="auth_email")
+        builder.button(text="🔑 Войти через расширение",      callback_data="login_extension")
         builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_auth_mode_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔐 Войти в аккаунт",    callback_data="auth_mode:login")
+    builder.button(text="📝 Зарегистрироваться", callback_data="auth_mode:register")
+    builder.button(text="🔙 Главное меню",        callback_data="back_to_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_cancel_auth_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="auth_cancel")
+    return builder.as_markup()
+
+
+def get_resend_code_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 Отправить код повторно", callback_data="auth_resend_code")
+    builder.button(text="❌ Отмена",                  callback_data="auth_cancel")
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -414,7 +435,8 @@ crypto: Optional[AioCryptoPay] = None
 # ══════════════════════════════════════════════════════════════════════════
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     tg_id     = message.from_user.id
     logged_in = tg_id in user_tokens
 
@@ -436,7 +458,7 @@ async def cmd_start(message: Message):
         uname = message.from_user.username
         if status == 200:
             token = resp["access_token"]
-            await user_tokens.set(tg_id, token)
+            user_tokens[tg_id] = token
             logged_in = True
             user_name = resp["user"].get("name") or resp["user"].get("email", "")
             tg_linked = resp.get("tg_linked", False)
@@ -493,7 +515,7 @@ async def cmd_start(message: Message):
                 f"💳 <b>Оформление подписки</b>\n\n"
                 f"{plan['emoji']} <b>{plan['title']}</b> — {plan['price_rub']}/мес\n\n"
                 f"{plan['description']}\n\n"
-                "Выбери способ оплаты 👇",
+                "<a href=\"https://selftabs.ru/privacy\">Политика конфиденциальности</a> · <a href=\"https://selftabs.ru/terms\">Пользовательское соглашение</a>\n\nВыбери способ оплаты 👇",
                 reply_markup=get_plan_payment_keyboard(plan_key),
             )
             return
@@ -513,7 +535,7 @@ async def cmd_start(message: Message):
             await message.answer(
                 f"🏦 <b>Оплата через СБП</b>\n\n"
                 f"{plan['emoji']} <b>{plan['title']}</b> — {plan['price_rub']}/мес\n\n"
-                "Выбери способ оплаты 👇",
+                "<a href=\"https://selftabs.ru/privacy\">Политика конфиденциальности</a> · <a href=\"https://selftabs.ru/terms\">Пользовательское соглашение</a>\n\nВыбери способ оплаты 👇",
                 reply_markup=get_plan_payment_keyboard(plan_key),
             )
             return
@@ -528,7 +550,7 @@ async def cmd_start(message: Message):
         token = user_tokens.get(tg_id)
         status, _ = await api_get("/me", token)
         if status == 401:
-            await user_tokens.pop(tg_id)
+            user_tokens.pop(tg_id, None)
             logged_in = False
 
     if logged_in:
@@ -546,7 +568,7 @@ async def cmd_start(message: Message):
             "🏢 <b>Team Workspace</b> — 950 ₽/мес\n\n"
             "💳 <b>Способы оплаты:</b>\n"
             "💫 Telegram Stars · 🏦 СБП · 🪙 USDT\n\n"
-            "🔑 Для входа открой расширение Selftabs и нажми «Открыть бот» 👇"
+            "📧 Войди по email или через расширение Selftabs 👇"
         )
     await message.answer(text, reply_markup=get_main_keyboard(logged_in, tg_id))
 
@@ -601,6 +623,431 @@ async def confirm_link(call: CallbackQuery):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# EMAIL-АВТОРИЗАЦИЯ (FSM)
+# ══════════════════════════════════════════════════════════════════════════
+
+@dp.callback_query(F.data == "auth_email")
+async def cb_auth_email(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(EmailAuthStates.choosing_mode)
+    await call.message.edit_text(
+        "📧 <b>Вход / Регистрация по Email</b>\n\n"
+        "Выбери действие:",
+        reply_markup=get_auth_mode_keyboard(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("auth_mode:"))
+async def cb_auth_mode(call: CallbackQuery, state: FSMContext):
+    mode = call.data.split(":", 1)[1]  # "login" или "register"
+    await state.update_data(auth_mode=mode)
+
+    if mode == "login":
+        await state.set_state(EmailAuthStates.login_email)
+        await call.message.edit_text(
+            "🔐 <b>Вход в аккаунт</b>\n\n"
+            "Введи свой <b>Email</b>:",
+            reply_markup=get_cancel_auth_keyboard(),
+        )
+    else:
+        await state.set_state(EmailAuthStates.reg_email)
+        await call.message.edit_text(
+            "📝 <b>Регистрация</b>\n\n"
+            "Введи свой <b>Email</b>:",
+            reply_markup=get_cancel_auth_keyboard(),
+        )
+    await call.answer()
+
+
+# ── ВХОД: ввод email ──────────────────────────────────────────────────────
+
+@dp.message(EmailAuthStates.login_email)
+async def login_email_input(message: Message, state: FSMContext):
+    email = message.text.strip().lower() if message.text else ""
+    if not _is_valid_email(email):
+        await message.answer(
+            "⚠️ Введи корректный email-адрес:",
+            reply_markup=get_cancel_auth_keyboard(),
+        )
+        return
+    await state.update_data(email=email)
+    await state.set_state(EmailAuthStates.login_password)
+    await message.answer(
+        f"📧 Email: <code>{email}</code>\n\n"
+        "Введи <b>пароль</b>:",
+        reply_markup=get_cancel_auth_keyboard(),
+    )
+
+
+# ── ВХОД: ввод пароля ─────────────────────────────────────────────────────
+
+@dp.message(EmailAuthStates.login_password)
+async def login_password_input(message: Message, state: FSMContext):
+    password = message.text or ""
+    # Удаляем сообщение с паролем для безопасности
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    data  = await state.get_data()
+    email = data.get("email", "")
+    tg_id = message.from_user.id
+    uname = message.from_user.username
+
+    if len(password) < 8:
+        await message.answer(
+            "⚠️ Пароль должен содержать минимум 8 символов.\n\nВведи пароль ещё раз:",
+            reply_markup=get_cancel_auth_keyboard(),
+        )
+        return
+
+    status, resp = await api_post(
+        "/auth/login",
+        {"email": email, "password": password},
+    )
+
+    if status == 200:
+        token = resp["access_token"]
+        user_tokens[tg_id] = token
+        await state.clear()
+
+        user_name = resp["user"].get("name") or email
+        log_event("EMAIL_LOGIN_OK", tg_id, uname, email=email)
+
+        # Привязываем Telegram автоматически
+        await _auto_link_telegram(tg_id, token)
+
+        await message.answer(
+            f"✅ <b>Добро пожаловать, {user_name}!</b>\n\n"
+            "Выбери действие 👇",
+            reply_markup=get_main_keyboard(True, tg_id),
+        )
+
+    elif status == 403:
+        detail = resp.get("detail", "")
+        await state.clear()
+        log_event("EMAIL_LOGIN_GOOGLE_ONLY", tg_id, uname, email=email)
+        if "google_only" in detail:
+            await message.answer(
+                "⚠️ <b>Этот аккаунт создан через Google.</b>\n\n"
+                "Войди через расширение Selftabs с кнопкой Google,\n"
+                "затем используй deep link для авторизации в боте.",
+                reply_markup=get_main_keyboard(False),
+            )
+        else:
+            await message.answer(
+                f"❌ {detail or 'Ошибка входа.'}",
+                reply_markup=get_main_keyboard(False),
+            )
+
+    elif status == 401:
+        log_event("EMAIL_LOGIN_WRONG_PASS", tg_id, uname, email=email)
+        await message.answer(
+            "❌ <b>Неверный email или пароль.</b>\n\n"
+            "Попробуй ещё раз — введи пароль:",
+            reply_markup=get_cancel_auth_keyboard(),
+        )
+        # Остаёмся в состоянии login_password
+
+    else:
+        detail = resp.get("detail", "Неизвестная ошибка")
+        log_error("EMAIL_LOGIN_FAIL", tg_id, uname, email=email, http_status=status, detail=detail)
+        await state.clear()
+        await message.answer(
+            f"❌ Ошибка: {detail}",
+            reply_markup=get_main_keyboard(False),
+        )
+
+
+# ── РЕГИСТРАЦИЯ: ввод email ───────────────────────────────────────────────
+
+@dp.message(EmailAuthStates.reg_email)
+async def reg_email_input(message: Message, state: FSMContext):
+    email = message.text.strip().lower() if message.text else ""
+    if not _is_valid_email(email):
+        await message.answer(
+            "⚠️ Введи корректный email-адрес:",
+            reply_markup=get_cancel_auth_keyboard(),
+        )
+        return
+    await state.update_data(email=email)
+    await state.set_state(EmailAuthStates.reg_password)
+    await message.answer(
+        f"📧 Email: <code>{email}</code>\n\n"
+        "Придумай <b>пароль</b> (минимум 8 символов):",
+        reply_markup=get_cancel_auth_keyboard(),
+    )
+
+
+# ── РЕГИСТРАЦИЯ: ввод пароля ──────────────────────────────────────────────
+
+@dp.message(EmailAuthStates.reg_password)
+async def reg_password_input(message: Message, state: FSMContext):
+    password = message.text or ""
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    if len(password) < 8:
+        await message.answer(
+            "⚠️ Пароль должен содержать минимум <b>8 символов</b>.\n\nВведи пароль ещё раз:",
+            reply_markup=get_cancel_auth_keyboard(),
+        )
+        return
+
+    await state.update_data(password=password)
+    await state.set_state(EmailAuthStates.reg_password2)
+    await message.answer(
+        "🔁 Повтори пароль для подтверждения:",
+        reply_markup=get_cancel_auth_keyboard(),
+    )
+
+
+# ── РЕГИСТРАЦИЯ: подтверждение пароля ────────────────────────────────────
+
+@dp.message(EmailAuthStates.reg_password2)
+async def reg_password2_input(message: Message, state: FSMContext):
+    password2 = message.text or ""
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    data     = await state.get_data()
+    email    = data.get("email", "")
+    password = data.get("password", "")
+    tg_id    = message.from_user.id
+    uname    = message.from_user.username
+
+    if password2 != password:
+        await message.answer(
+            "❌ <b>Пароли не совпадают.</b>\n\nВведи пароль ещё раз:",
+            reply_markup=get_cancel_auth_keyboard(),
+        )
+        await state.set_state(EmailAuthStates.reg_password)
+        return
+
+    # Регистрируем через API
+    status, resp = await api_post(
+        "/auth/register",
+        {"email": email, "password": password},
+    )
+
+    if status == 200 or status == 201:
+        token = resp["access_token"]
+        user_tokens[tg_id] = token
+        log_event("EMAIL_REGISTER_OK", tg_id, uname, email=email)
+
+        # Привязываем Telegram автоматически
+        await _auto_link_telegram(tg_id, token)
+
+        # Запрашиваем код подтверждения email
+        verify_status, verify_resp = await api_post(
+            "/auth/email/send-code",
+            {"email": email},
+            token=token,
+        )
+
+        await state.update_data(verify_email=email, verify_token=token)
+        await state.set_state(EmailAuthStates.verify_code)
+
+        if verify_status == 200:
+            expires = verify_resp.get("expires_at", "")[:16].replace("T", " ")
+            await message.answer(
+                f"🎉 <b>Аккаунт создан!</b>\n\n"
+                f"📧 На адрес <code>{email}</code> отправлен <b>6-значный код</b> подтверждения.\n"
+                f"⏱ Действителен до: <b>{expires}</b>\n\n"
+                "Введи код из письма:",
+                reply_markup=get_resend_code_keyboard(),
+            )
+        else:
+            # Аккаунт создан, но письмо не дошло — не критично, просим ввести код
+            await message.answer(
+                f"🎉 <b>Аккаунт создан!</b>\n\n"
+                f"Не удалось отправить код на <code>{email}</code>.\n"
+                "Нажми «Отправить повторно» 👇",
+                reply_markup=get_resend_code_keyboard(),
+            )
+
+    elif status == 409:
+        log_event("EMAIL_REGISTER_EXISTS", tg_id, uname, email=email)
+        await state.clear()
+        await message.answer(
+            "⚠️ <b>Email уже зарегистрирован.</b>\n\n"
+            "Войди в существующий аккаунт:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔐 Войти", callback_data="auth_mode:login")],
+                [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")],
+            ]),
+        )
+
+    else:
+        detail = resp.get("detail", "Неизвестная ошибка")
+        log_error("EMAIL_REGISTER_FAIL", tg_id, uname, email=email, http_status=status, detail=detail)
+        await state.clear()
+        await message.answer(
+            f"❌ Ошибка регистрации: {detail}",
+            reply_markup=get_main_keyboard(False),
+        )
+
+
+# ── ВЕРИФИКАЦИЯ EMAIL: ввод кода ──────────────────────────────────────────
+
+@dp.message(EmailAuthStates.verify_code)
+async def verify_code_input(message: Message, state: FSMContext):
+    code  = message.text.strip() if message.text else ""
+    tg_id = message.from_user.id
+    uname = message.from_user.username
+
+    data  = await state.get_data()
+    email = data.get("verify_email", "")
+    token = data.get("verify_token", "")
+
+    if not code.isdigit() or len(code) != 6:
+        await message.answer(
+            "⚠️ Введи <b>6-значный</b> числовой код из письма:",
+            reply_markup=get_resend_code_keyboard(),
+        )
+        return
+
+    verify_status, verify_resp = await api_post(
+        "/auth/email/verify",
+        {"email": email, "code": code},
+        token=token,
+    )
+
+    if verify_status == 200:
+        await state.clear()
+        log_event("EMAIL_VERIFIED", tg_id, uname, email=email)
+        await message.answer(
+            "✅ <b>Email подтверждён!</b>\n\n"
+            "Добро пожаловать в Selftabs 🎉\n\n"
+            "Выбери действие 👇",
+            reply_markup=get_main_keyboard(True, tg_id),
+        )
+
+    elif verify_status == 429:
+        detail = verify_resp.get("detail", "Превышено количество попыток.")
+        await state.clear()
+        log_event("EMAIL_VERIFY_LIMIT", tg_id, uname, email=email)
+        await message.answer(
+            f"🚫 <b>{detail}</b>\n\n"
+            "Запроси новый код:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Запросить новый код", callback_data="auth_resend_code")],
+                [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")],
+            ]),
+        )
+
+    elif verify_status == 400:
+        detail = verify_resp.get("detail", "Неверный код.")
+        log_event("EMAIL_VERIFY_WRONG", tg_id, uname, email=email)
+        await message.answer(
+            f"❌ {detail}\n\nВведи код ещё раз:",
+            reply_markup=get_resend_code_keyboard(),
+        )
+        # Остаёмся в состоянии verify_code
+
+    else:
+        detail = verify_resp.get("detail", "Неизвестная ошибка")
+        log_error("EMAIL_VERIFY_FAIL", tg_id, uname, email=email, http_status=verify_status, detail=detail)
+        await state.clear()
+        await message.answer(
+            f"❌ Ошибка верификации: {detail}",
+            reply_markup=get_main_keyboard(True, tg_id),
+        )
+
+
+# ── Переотправить код ─────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "auth_resend_code")
+async def cb_resend_code(call: CallbackQuery, state: FSMContext):
+    tg_id = call.from_user.id
+    uname = call.from_user.username
+
+    data  = await state.get_data()
+    email = data.get("verify_email", "")
+    token = data.get("verify_token", user_tokens.get(tg_id))
+
+    if not email:
+        await call.answer("⚠️ Email не найден. Начни заново.", show_alert=True)
+        await state.clear()
+        return
+
+    status, resp = await api_post(
+        "/auth/email/send-code",
+        {"email": email},
+        token=token,
+    )
+
+    if status == 200:
+        expires = resp.get("expires_at", "")[:16].replace("T", " ")
+        log_event("EMAIL_CODE_RESENT", tg_id, uname, email=email)
+        await call.message.edit_text(
+            f"📨 <b>Новый код отправлен</b> на <code>{email}</code>\n"
+            f"⏱ Действителен до: <b>{expires}</b>\n\n"
+            "Введи 6-значный код из письма:",
+            reply_markup=get_resend_code_keyboard(),
+        )
+        await state.set_state(EmailAuthStates.verify_code)
+
+    elif status == 429:
+        detail = resp.get("detail", "Слишком много запросов.")
+        log_event("EMAIL_CODE_RATELIMIT", tg_id, uname, email=email)
+        await call.answer(f"🚫 {detail}", show_alert=True)
+
+    elif status == 400:
+        # Email уже верифицирован
+        await state.clear()
+        await call.message.edit_text(
+            "✅ <b>Email уже подтверждён!</b>\n\nВыбери действие 👇",
+            reply_markup=get_main_keyboard(True, tg_id),
+        )
+
+    else:
+        detail = resp.get("detail", "Ошибка отправки кода.")
+        await call.answer(f"❌ {detail}", show_alert=True)
+
+    await call.answer()
+
+
+# ── Отмена авторизации ────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "auth_cancel")
+async def cb_auth_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    tg_id = call.from_user.id
+    logged_in = tg_id in user_tokens
+    await call.message.edit_text(
+        "🌟 <b>Selftabs</b>\n\nВыбери действие 👇",
+        reply_markup=get_main_keyboard(logged_in, tg_id),
+    )
+    await call.answer()
+
+
+# ── Утилиты ───────────────────────────────────────────────────────────────
+
+def _is_valid_email(email: str) -> bool:
+    import re
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email))
+
+
+async def _auto_link_telegram(tg_id: int, token: str):
+    """Автоматически привязывает Telegram ID к аккаунту после входа/регистрации."""
+    try:
+        await api_post(
+            "/api/v1/me/integrations/telegram",
+            {"telegram_id": tg_id},
+            token=token,
+        )
+    except Exception as e:
+        logger.warning(f"[AUTO_LINK_TG] tg={tg_id} error={e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # НАВИГАЦИЯ (inline)
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -615,7 +1062,7 @@ async def back_to_main(call: CallbackQuery, state: FSMContext):
         "Выбери действие 👇"
         if logged_in else
         "🌟 <b>Selftabs — умное расширение для браузера</b>\n\n"
-        "Войди в аккаунт для управления подпиской 👇"
+        "📧 Войди по email или через расширение Selftabs 👇"
     )
     await call.message.edit_text(text, reply_markup=get_main_keyboard(logged_in, tg_id))
     await call.answer()
@@ -624,14 +1071,14 @@ async def back_to_main(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "login_extension")
 async def cb_login_extension(call: CallbackQuery):
     await call.message.edit_text(
-        "🔑 <b>Вход в Selftabs</b>\n\n"
-        "Авторизация доступна только через браузерное расширение:\n\n"
+        "🔑 <b>Вход через расширение</b>\n\n"
         "1️⃣ Открой расширение <b>Selftabs</b> в браузере\n"
         "2️⃣ Войди в аккаунт в расширении\n"
         "3️⃣ Нажми кнопку <b>«Открыть бот»</b> — ты будешь авторизован автоматически\n\n"
-        "<i>Telegram будет привязан к аккаунту автоматически.</i>",
+        "<i>Telegram привяжется к аккаунту автоматически.</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")],
+            [InlineKeyboardButton(text="📧 Войти по Email", callback_data="auth_email")],
+            [InlineKeyboardButton(text="🔙 Главное меню",   callback_data="back_to_main")],
         ]),
     )
     await call.answer()
@@ -649,7 +1096,7 @@ async def cb_profile(call: CallbackQuery):
     status, user = await api_get("/me", token)
 
     if status == 401:
-        await user_tokens.pop(tg_id)
+        user_tokens.pop(tg_id, None)
         await call.message.edit_text("⚠️ Сессия истекла. Войди заново.", reply_markup=get_main_keyboard(False))
         await call.answer()
         return
@@ -667,22 +1114,73 @@ async def cb_profile(call: CallbackQuery):
     plan_emoji, plan_name = PLAN_NAMES.get(plan_key, ("🆓", plan_key.capitalize()))
     tg_linked = "✅ Привязан" if integrations.get("telegram_id") else "❌ Не привязан"
     google    = "✅ Привязан" if auth.get("google_linked") else "❌ Не привязан"
+    email_ver = "✅" if auth.get("email_verified") else "⚠️ Не подтверждён"
     exp_str   = f"\n📅 До: <b>{expires[:10]}</b>" if expires and plan_key != "standard" else ""
+
+    keyboard_rows = [
+        [InlineKeyboardButton(text="💳 Подписка", callback_data="subscription")],
+    ]
+    # Если email не верифицирован — предлагаем подтвердить
+    if not auth.get("email_verified"):
+        keyboard_rows.insert(0, [
+            InlineKeyboardButton(text="📧 Подтвердить Email", callback_data="verify_email_start")
+        ])
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")])
 
     await call.message.edit_text(
         f"👤 <b>Мой профиль</b>\n\n"
         f"<b>{user.get('name') or 'Без имени'}</b>\n"
-        f"📧 {user.get('email')}\n"
+        f"📧 {user.get('email')} {email_ver}\n"
         f"🏷 @{user.get('username') or '—'}\n\n"
         f"{plan_emoji} Подписка: <b>{plan_name}</b>{exp_str}\n\n"
         f"🔗 Telegram: {tg_linked}\n"
         f"🔗 Google: {google}\n"
         f"🔒 2FA Telegram: {'✅' if settings.get('2fa_telegram') else '❌'}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Подписка", callback_data="subscription")],
-            [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")],
-        ]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
     )
+    await call.answer()
+
+
+# ── Верификация email из профиля (если ещё не верифицирован) ─────────────
+
+@dp.callback_query(F.data == "verify_email_start")
+async def cb_verify_email_start(call: CallbackQuery, state: FSMContext):
+    tg_id = call.from_user.id
+    token = user_tokens.get(tg_id)
+    if not token:
+        await call.answer("⚠️ Войди в аккаунт.", show_alert=True)
+        return
+
+    _, user = await api_get("/me", token)
+    email   = user.get("email", "")
+
+    send_status, send_resp = await api_post(
+        "/auth/email/send-code",
+        {"email": email},
+        token=token,
+    )
+
+    await state.update_data(verify_email=email, verify_token=token)
+    await state.set_state(EmailAuthStates.verify_code)
+
+    if send_status == 200:
+        expires = send_resp.get("expires_at", "")[:16].replace("T", " ")
+        await call.message.edit_text(
+            f"📧 Код отправлен на <code>{email}</code>\n"
+            f"⏱ Действителен до: <b>{expires}</b>\n\n"
+            "Введи 6-значный код:",
+            reply_markup=get_resend_code_keyboard(),
+        )
+    elif send_status == 400:
+        await call.message.edit_text(
+            "✅ Email уже подтверждён.",
+            reply_markup=get_back_main_keyboard(),
+        )
+        await state.clear()
+    else:
+        detail = send_resp.get("detail", "Ошибка отправки кода.")
+        await call.answer(f"❌ {detail}", show_alert=True)
+
     await call.answer()
 
 
@@ -747,7 +1245,7 @@ async def cb_link_tg(call: CallbackQuery):
         )
     elif status == 401:
         log_event("SESSION_EXPIRED", tg_id, uname, handler="link_tg")
-        await user_tokens.pop(tg_id)
+        user_tokens.pop(tg_id, None)
         await call.message.edit_text("⚠️ Сессия истекла. Войди заново.", reply_markup=get_main_keyboard(False))
     else:
         log_error("TG_LINK_FAIL_PROFILE", tg_id, uname, http_status=status,
@@ -760,7 +1258,8 @@ async def cb_link_tg(call: CallbackQuery):
 
 
 @dp.callback_query(F.data == "logout")
-async def cb_logout(call: CallbackQuery):
+async def cb_logout(call: CallbackQuery, state: FSMContext):
+    await state.clear()
     tg_id = call.from_user.id
     token = user_tokens.get(tg_id)
     if token:
@@ -768,7 +1267,7 @@ async def cb_logout(call: CallbackQuery):
             await api_delete("/me/integrations/telegram", token)
         except Exception as e:
             logging.warning(f"Ошибка при отвязке Telegram: {e}")
-    await user_tokens.pop(tg_id)
+    user_tokens.pop(tg_id, None)
     await call.message.edit_text(
         "👋 <b>Ты вышел из аккаунта.</b>\n\nДо скорой встречи!",
         reply_markup=get_main_keyboard(False),
@@ -820,7 +1319,7 @@ async def cb_daily_digest(call: CallbackQuery):
 
     me_status, me = await api_get("/me", token)
     if me_status == 401:
-        await user_tokens.pop(tg_id)
+        user_tokens.pop(tg_id, None)
         await call.message.edit_text("⚠️ Сессия истекла. Войди заново.", reply_markup=get_main_keyboard(False))
         return
     if me_status != 200:
@@ -934,15 +1433,8 @@ async def cb_my_sessions(call: CallbackQuery):
     sessions_status, sessions_data = await api_get("/sessions", token)
     stats_status, stats = await api_get("/me/stats?period=all", token)
 
-    logging.info(
-        f"[sessions] tg={tg_id} sess_status={sessions_status} "
-        f"data_type={type(sessions_data).__name__} "
-        f"len={len(sessions_data) if isinstance(sessions_data, list) else '?'} "
-        f"stats_status={stats_status}"
-    )
-
     if sessions_status == 401 or stats_status == 401:
-        await user_tokens.pop(tg_id)
+        user_tokens.pop(tg_id, None)
         await call.message.edit_text("⚠️ Сессия истекла. Войди заново.", reply_markup=get_main_keyboard(False))
         return
 
@@ -993,7 +1485,6 @@ async def cb_my_sessions(call: CallbackQuery):
         for s in sessions_page:
             tag         = s.get("context_tag") or "—"
             tabs_list   = s.get("tabs") or []
-            tabs_count  = len(tabs_list)
             created_raw = s.get("created_at") or ""
 
             try:
@@ -1080,7 +1571,7 @@ async def show_plan_info(call: CallbackQuery):
         f"💫 Telegram Stars — {plan['stars']} ⭐/мес\n"
         f"🏦 СБП — {plan['sbp_rub']} ₽/мес\n"
         f"🪙 USDT — {plan['usdt']}$ (~{plan['usdt_rub']} ₽)/мес\n\n"
-        "Нажми на кнопку ниже 👇",
+        "<a href=\"https://selftabs.ru/privacy\">Политика конфиденциальности</a> · <a href=\"https://selftabs.ru/terms\">Пользовательское соглашение</a>\n\nНажми на кнопку ниже 👇",
         reply_markup=get_plan_payment_keyboard(plan_key),
     )
     await call.answer()
@@ -1155,11 +1646,6 @@ async def pre_checkout(query: PreCheckoutQuery):
 
 
 async def refund_stars(tg_id: int, charge_id: str) -> bool:
-    """
-    Возвращает звёзды пользователю.
-    Используется только во время тестирования!
-    Убери вызов перед выходом в прод.
-    """
     try:
         await bot.refund_star_payment(
             user_id=tg_id,
@@ -1250,8 +1736,55 @@ async def payment_success(message: Message):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# ОПЛАТА — СБП (Robokassa)
+# ОПЛАТА — СБП (Platega)
 # ══════════════════════════════════════════════════════════════════════════
+
+async def _platega_create(plan_key: str, method: str, user_id: str | None) -> dict:
+    """
+    Создаёт транзакцию через /api/v1/payments/platega/create-internal.
+    Возвращает dict с transaction_id и redirect_url.
+    """
+    headers = {
+        "Content-Type":  "application/json",
+        "X-Bot-Secret":  PLATEGA_BOT_SECRET,
+    }
+    payload = {"plan": plan_key, "method": method}
+    if user_id:
+        payload["user_id"] = user_id
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{API_URL}/payments/platega/create-internal",
+            json=payload,
+            headers=headers,
+        ) as r:
+            try:
+                data = await r.json()
+            except Exception:
+                data = {}
+            if r.status not in (200, 201):
+                detail = data.get("detail", str(data))[:200]
+                raise RuntimeError(f"Бэк вернул {r.status}: {detail}")
+            return data
+
+
+async def _platega_check_internal(transaction_id: str) -> str:
+    """
+    Опрашивает /api/v1/payments/platega/internal/{txn_id}.
+    Возвращает status: PENDING | CONFIRMED | CANCELED
+    """
+    headers = {"X-Bot-Secret": PLATEGA_BOT_SECRET}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{API_URL}/payments/platega/internal/{transaction_id}",
+            headers=headers,
+        ) as r:
+            try:
+                data = await r.json()
+            except Exception:
+                data = {}
+            return data.get("status", "PENDING")
+
 
 @dp.callback_query(F.data.startswith("buy_sbp:"))
 async def initiate_sbp_purchase(call: CallbackQuery):
@@ -1268,32 +1801,23 @@ async def initiate_sbp_purchase(call: CallbackQuery):
         await call.answer("Неизвестный план.", show_alert=True)
         return
 
-    if not ROBOKASSA_LOGIN or not ROBOKASSA_PASSWORD1:
-        log_event("SBP_UNAVAILABLE", tg_id, uname, plan=plan_key)
-        await call.answer()
-        await call.message.edit_text(
-            "🏦 <b>Оплата через СБП временно недоступна</b>\n\n"
-            "Напиши нам — активируем вручную:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📩 Поддержка", url="https://t.me/selftabs_support")],
-                [InlineKeyboardButton(text="🔙 Назад",     callback_data=f"sub_info:{plan_key}")],
-            ]),
-        )
-        return
-
     log_event("SBP_INVOICE_INIT", tg_id, uname, plan=plan_key, rub=plan["sbp_rub"])
     await call.answer("⏳ Создаём платёж...")
 
-    status, resp = await api_post(
-        "/subscription/robokassa/create",
-        {"plan": plan_key, "tg_id": tg_id, "bot_secret": BOT_SECRET},
-    )
+    # Получаем user_id бэкенда из токена для корректной привязки
+    token   = user_tokens.get(tg_id)
+    user_id = None
+    if token:
+        s, u = await api_get("/me", token)
+        if s == 200:
+            user_id = u.get("id")
 
-    if status != 200:
-        log_error("SBP_INVOICE_FAIL", tg_id, uname, plan=plan_key,
-                  http_status=status, detail=resp.get("detail", resp))
+    try:
+        resp = await _platega_create(plan_key, "sbp", user_id)
+    except Exception as e:
+        log_error("SBP_INVOICE_FAIL", tg_id, uname, plan=plan_key, error=str(e))
         await call.message.edit_text(
-            "❌ Не удалось создать платёж. Попробуй позже или напиши в поддержку.",
+            f"❌ Ошибка создания платежа: {str(e)[:200]}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📩 Поддержка", url="https://t.me/selftabs_support")],
                 [InlineKeyboardButton(text="🔙 Назад",     callback_data=f"sub_info:{plan_key}")],
@@ -1301,24 +1825,27 @@ async def initiate_sbp_purchase(call: CallbackQuery):
         )
         return
 
-    pay_url    = resp["payment_url"]
-    amount_rub = resp["amount_rub"]
-    inv_id     = resp["inv_id"]
+    txn_id      = resp["transaction_id"]
+    pay_url     = resp["redirect_url"]
+    amount_rub  = int(resp.get("amount", plan["sbp_rub"]))
     log_event("SBP_INVOICE_CREATED", tg_id, uname, plan=plan_key,
-              inv_id=inv_id, amount_rub=amount_rub)
+              txn_id=txn_id, amount_rub=amount_rub)
 
     await call.message.edit_text(
         f"🏦 <b>Оплата через СБП</b>\n\n"
         f"{plan['emoji']} Тариф: <b>{plan['title']}</b>\n"
         f"💰 Сумма: <b>{amount_rub} ₽ / месяц</b>\n"
         f"📅 Срок: 30 дней\n\n"
-        "1️⃣ Нажми «Оплатить» — откроется страница Robokassa\n"
-        "2️⃣ Выбери СБП или карту и подтверди платёж\n"
-        "3️⃣ Вернись и нажми «Я оплатил — проверить»\n\n"
-        f"<i>🔐 ID платежа: <code>{inv_id}</code></i>",
+        "1️⃣ Нажми «Оплатить» — откроется страница оплаты\n"
+        "2️⃣ Оплати через СБП и вернись сюда\n"
+        "3️⃣ Нажми «✅ Я оплатил — проверить»\n\n"
+        f"<i>🔐 ID транзакции: <code>{txn_id}</code></i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"🏦 Оплатить {amount_rub} ₽", url=pay_url)],
-            [InlineKeyboardButton(text="✅ Я оплатил — проверить", callback_data=f"check_sbp:{plan_key}")],
+            [InlineKeyboardButton(
+                text="✅ Я оплатил — проверить",
+                callback_data=f"check_sbp:{plan_key}:{txn_id}",
+            )],
             [InlineKeyboardButton(text="🔙 Назад", callback_data=f"sub_info:{plan_key}")],
         ]),
     )
@@ -1326,48 +1853,74 @@ async def initiate_sbp_purchase(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("check_sbp:"))
 async def check_sbp_payment(call: CallbackQuery):
-    plan_key = call.data.split(":", 1)[1]
+    parts    = call.data.split(":")
+    plan_key = parts[1]
+    txn_id   = parts[2] if len(parts) > 2 else ""
     tg_id    = call.from_user.id
     uname    = call.from_user.username
-    token    = user_tokens.get(tg_id)
+    plan     = PLANS.get(plan_key, {})
 
-    log_event("SBP_CHECK", tg_id, uname, plan=plan_key)
+    log_event("SBP_CHECK", tg_id, uname, plan=plan_key, txn_id=txn_id)
     await call.answer("🔄 Проверяем оплату...")
 
-    status, resp = await api_get("/api/v1/subscription", token=token)
+    if not txn_id:
+        await call.message.edit_text(
+            "❌ Не удалось определить ID транзакции. Обратись в поддержку.",
+            reply_markup=get_back_main_keyboard(),
+        )
+        return
 
-    if status == 200:
-        current_plan = resp.get("plan", "standard")
-        if current_plan == plan_key:
-            expires = (resp.get("subscription_expires_at") or "")[:10]
-            plan    = PLANS.get(plan_key, {})
-            log_event("SBP_SUB_ACTIVATED", tg_id, uname, plan=plan_key, expires=expires)
-            await call.message.edit_text(
-                f"🎉 <b>Подписка активирована!</b>\n\n"
-                f"{plan.get('emoji', '')} Тариф: <b>{plan.get('title', plan_key)}</b>\n"
-                f"🏦 Способ: СБП (Robokassa)\n"
-                f"💰 Оплачено: {plan.get('sbp_rub')} ₽\n"
-                f"📅 Действует до: <b>{expires}</b>\n\n"
-                "Вернись в расширение — статус уже обновлён 🚀",
-                reply_markup=get_main_keyboard(True),
-            )
-            return
+    try:
+        status = await _platega_check_internal(txn_id)
+    except Exception as e:
+        log_error("SBP_CHECK_FAIL", tg_id, uname, plan=plan_key, txn_id=txn_id, error=str(e))
+        await call.message.edit_text(
+            f"❌ Ошибка проверки статуса: {str(e)[:200]}",
+            reply_markup=get_back_main_keyboard(),
+        )
+        return
 
-    log_event("SBP_NOT_CONFIRMED", tg_id, uname, plan=plan_key, api_status=status)
-    await call.message.edit_text(
-        "⏳ <b>Оплата ещё не подтверждена.</b>\n\n"
-        "Robokassa обычно подтверждает платёж за 10–30 секунд.\n"
-        "Подожди немного и попробуй снова:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Проверить снова",  callback_data=f"check_sbp:{plan_key}")],
-            [InlineKeyboardButton(text="📩 Поддержка",        url="https://t.me/selftabs_support")],
-            [InlineKeyboardButton(text="🔙 Назад",            callback_data="subscription")],
-        ]),
-    )
+    if status == "CONFIRMED":
+        log_event("SBP_SUB_ACTIVATED", tg_id, uname, plan=plan_key, txn_id=txn_id)
+        await call.message.edit_text(
+            f"🎉 <b>Подписка активирована!</b>\n\n"
+            f"{plan.get('emoji', '')} Тариф: <b>{plan.get('title', plan_key)}</b>\n"
+            f"🏦 Способ: СБП (Platega)\n"
+            f"💰 Оплачено: {plan.get('sbp_rub')} ₽\n"
+            f"📅 Срок: 30 дней\n\n"
+            "Вернись в расширение — статус уже обновлён 🚀",
+            reply_markup=get_main_keyboard(True, tg_id),
+        )
+    elif status == "CANCELED":
+        log_event("SBP_CANCELED", tg_id, uname, plan=plan_key, txn_id=txn_id)
+        await call.message.edit_text(
+            "❌ <b>Платёж отменён или не прошёл.</b>\n\n"
+            "Попробуй ещё раз или выбери другой способ оплаты.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"buy_sbp:{plan_key}")],
+                [InlineKeyboardButton(text="📩 Поддержка",         url="https://t.me/selftabs_support")],
+                [InlineKeyboardButton(text="🔙 Назад",             callback_data="subscription")],
+            ]),
+        )
+    else:  # PENDING
+        log_event("SBP_NOT_CONFIRMED", tg_id, uname, plan=plan_key, txn_id=txn_id)
+        await call.message.edit_text(
+            "⏳ <b>Оплата ещё не подтверждена.</b>\n\n"
+            "Platega обычно подтверждает платёж за 10–30 секунд.\n"
+            "Подожди немного и попробуй снова:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🔄 Проверить снова",
+                    callback_data=f"check_sbp:{plan_key}:{txn_id}",
+                )],
+                [InlineKeyboardButton(text="📩 Поддержка", url="https://t.me/selftabs_support")],
+                [InlineKeyboardButton(text="🔙 Назад",     callback_data="subscription")],
+            ]),
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# ОПЛАТА — USDT (CryptoPay)
+# ОПЛАТА — КРИПТА (Platega)
 # ══════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data.startswith("buy_crypto:"))
@@ -1388,136 +1941,109 @@ async def initiate_crypto_purchase(call: CallbackQuery):
     log_event("CRYPTO_INVOICE_INIT", tg_id, uname, plan=plan_key, usdt=plan["usdt"])
     await call.answer("🔄 Создание крипто-счёта...")
 
+    # Получаем user_id бэкенда для привязки платежа
+    token   = user_tokens.get(tg_id)
+    user_id = None
+    if token:
+        s, u = await api_get("/me", token)
+        if s == 200:
+            user_id = u.get("id")
+
     try:
-        invoice = await crypto.create_invoice(
-            asset="USDT",
-            amount=str(plan["usdt"]),
-            description=f"Selftabs {plan['title']} — 30 дней",
-            payload=f"{tg_id}_{plan_key}",
-        )
-        log_event("CRYPTO_INVOICE_CREATED", tg_id, uname, plan=plan_key,
-                  invoice_id=invoice.invoice_id, usdt=plan["usdt"])
-
-        await call.message.edit_text(
-            f"🪙 <b>Крипто-счёт создан!</b>\n\n"
-            f"{plan['emoji']} Тариф: <b>{plan['title']}</b>\n"
-            f"💰 Сумма: <b>{plan['usdt']} USDT</b> (~{plan['usdt_rub']} ₽)\n"
-            f"📅 Срок: 30 дней\n\n"
-            f"🔗 <b>Ссылка для оплаты:</b>\n{invoice.bot_invoice_url}\n\n"
-            "После оплаты нажми «✅ Проверить оплату» 👇",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="✅ Проверить оплату",
-                    callback_data=f"check_crypto:{invoice.invoice_id}:{plan_key}",
-                )],
-                [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data=f"buy_crypto:{plan_key}")],
-                [InlineKeyboardButton(text="🔙 Назад",        callback_data=f"sub_info:{plan_key}")],
-            ]),
-        )
-
+        resp = await _platega_create(plan_key, "crypto", user_id)
     except Exception as e:
-        log_error("CRYPTO_INVOICE_FAIL", tg_id, uname, plan=plan_key, error=e)
+        log_error("CRYPTO_INVOICE_FAIL", tg_id, uname, plan=plan_key, error=str(e))
         await call.message.edit_text(
             f"❌ Ошибка создания счёта: {str(e)[:200]}",
-            reply_markup=get_back_main_keyboard(),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📩 Поддержка", url="https://t.me/selftabs_support")],
+                [InlineKeyboardButton(text="🔙 Назад",     callback_data=f"sub_info:{plan_key}")],
+            ]),
         )
+        return
+
+    txn_id   = resp["transaction_id"]
+    pay_url  = resp["redirect_url"]
+    log_event("CRYPTO_INVOICE_CREATED", tg_id, uname, plan=plan_key,
+              txn_id=txn_id, usdt=plan["usdt"])
+
+    await call.message.edit_text(
+        f"🪙 <b>Оплата криптовалютой</b>\n\n"
+        f"{plan['emoji']} Тариф: <b>{plan['title']}</b>\n"
+        f"💰 Сумма: <b>~{plan['usdt']}$</b> (~{plan['usdt_rub']} ₽)\n"
+        f"📅 Срок: 30 дней\n\n"
+        "1️⃣ Нажми «Оплатить» — откроется страница Platega\n"
+        "2️⃣ Выбери криптовалюту и отправь платёж\n"
+        "3️⃣ Вернись и нажми «✅ Проверить оплату»\n\n"
+        f"<i>🔐 ID транзакции: <code>{txn_id}</code></i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🪙 Оплатить ~{plan['usdt']}$", url=pay_url)],
+            [InlineKeyboardButton(
+                text="✅ Проверить оплату",
+                callback_data=f"check_crypto:{txn_id}:{plan_key}",
+            )],
+            [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data=f"buy_crypto:{plan_key}")],
+            [InlineKeyboardButton(text="🔙 Назад",        callback_data=f"sub_info:{plan_key}")],
+        ]),
+    )
 
 
 @dp.callback_query(F.data.startswith("check_crypto:"))
 async def check_crypto_payment(call: CallbackQuery):
-    parts      = call.data.split(":")
-    invoice_id = int(parts[1])
-    plan_key   = parts[2]
-    tg_id      = call.from_user.id
-    uname      = call.from_user.username
+    parts    = call.data.split(":")
+    txn_id   = parts[1]
+    plan_key = parts[2] if len(parts) > 2 else ""
+    tg_id    = call.from_user.id
+    uname    = call.from_user.username
+    plan     = PLANS.get(plan_key, {})
 
-    log_event("CRYPTO_CHECK", tg_id, uname, plan=plan_key, invoice_id=invoice_id)
+    log_event("CRYPTO_CHECK", tg_id, uname, plan=plan_key, txn_id=txn_id)
     await call.answer("🔄 Проверка оплаты...")
 
     try:
-        invoices = await crypto.get_invoices(invoice_ids=str(invoice_id))
-
-        if invoices and len(invoices) > 0:
-            invoice = invoices[0]
-            status  = invoice.status
-
-            if status == "paid":
-                plan      = PLANS.get(plan_key, {})
-                plan_name = plan.get("title", plan_key.capitalize())
-
-                token = user_tokens.get(tg_id)
-                if token:
-                    act_status, act_resp = await api_post(
-                        "/subscription/crypto/activate",
-                        {
-                            "telegram_id": tg_id,
-                            "plan":        plan_key,
-                            "invoice_id":  str(invoice_id),
-                            "asset":       "USDT",
-                            "amount":      plan.get("usdt"),
-                            "bot_secret":  BOT_SECRET,
-                        },
-                        token=token,
-                    )
-                    if act_status == 200:
-                        log_event("CRYPTO_SUB_ACTIVATED", tg_id, uname, plan=plan_key,
-                                  invoice_id=invoice_id, usdt=plan.get("usdt"))
-                    else:
-                        log_error("CRYPTO_ACTIVATE_FAIL", tg_id, uname, plan=plan_key,
-                                  invoice_id=invoice_id, http_status=act_status,
-                                  detail=act_resp.get("detail", "—"))
-
-                await call.message.edit_text(
-                    f"🎉 <b>Оплата получена!</b>\n\n"
-                    f"{plan.get('emoji', '')} Тариф: <b>{plan_name}</b>\n"
-                    f"🪙 Оплачено: <b>{plan.get('usdt')} USDT</b> (~{plan.get('usdt_rub')} ₽)\n"
-                    f"📅 Подписка активирована на 30 дней\n\n"
-                    "Вернись в расширение — статус уже обновлён 🚀",
-                    reply_markup=get_main_keyboard(True),
-                )
-
-            elif status == "expired":
-                log_event("CRYPTO_INVOICE_EXPIRED", tg_id, uname, plan=plan_key, invoice_id=invoice_id)
-                await call.message.edit_text(
-                    "⏰ <b>Срок оплаты истёк.</b>\n\n"
-                    "Нажми «Новая ссылка» для создания нового счёта.",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data=f"buy_crypto:{plan_key}")],
-                        [InlineKeyboardButton(text="🔙 Назад",        callback_data="subscription")],
-                    ]),
-                )
-            else:
-                log_event("CRYPTO_PENDING", tg_id, uname, plan=plan_key,
-                          invoice_id=invoice_id, invoice_status=status)
-                await call.message.edit_text(
-                    f"⏳ <b>Ожидание оплаты...</b>\n\n"
-                    f"Статус: {status}\n\n"
-                    "После оплаты нажми «Проверить снова» 👇",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(
-                            text="✅ Проверить снова",
-                            callback_data=f"check_crypto:{invoice_id}:{plan_key}",
-                        )],
-                        [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data=f"buy_crypto:{plan_key}")],
-                        [InlineKeyboardButton(text="🔙 Назад",        callback_data="subscription")],
-                    ]),
-                )
-        else:
-            log_error("CRYPTO_INVOICE_NOT_FOUND", tg_id, uname, plan=plan_key, invoice_id=invoice_id)
-            await call.message.edit_text(
-                "❌ Счёт не найден. Создайте новый:",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data=f"buy_crypto:{plan_key}")],
-                    [InlineKeyboardButton(text="🔙 Назад",        callback_data="subscription")],
-                ]),
-            )
-
+        status = await _platega_check_internal(txn_id)
     except Exception as e:
-        log_error("CRYPTO_CHECK_EXCEPTION", tg_id, uname, plan=plan_key,
-                  invoice_id=invoice_id, error=e)
+        log_error("CRYPTO_CHECK_EXCEPTION", tg_id, uname, plan=plan_key, txn_id=txn_id, error=str(e))
         await call.message.edit_text(
             f"❌ Ошибка проверки: {str(e)[:200]}",
             reply_markup=get_back_main_keyboard(),
+        )
+        return
+
+    if status == "CONFIRMED":
+        log_event("CRYPTO_SUB_ACTIVATED", tg_id, uname, plan=plan_key, txn_id=txn_id)
+        await call.message.edit_text(
+            f"🎉 <b>Оплата получена!</b>\n\n"
+            f"{plan.get('emoji', '')} Тариф: <b>{plan.get('title', plan_key)}</b>\n"
+            f"🪙 Оплачено: <b>~{plan.get('usdt')}$</b> (~{plan.get('usdt_rub')} ₽)\n"
+            f"📅 Подписка активирована на 30 дней\n\n"
+            "Вернись в расширение — статус уже обновлён 🚀",
+            reply_markup=get_main_keyboard(True, tg_id),
+        )
+    elif status == "CANCELED":
+        log_event("CRYPTO_CANCELED", tg_id, uname, plan=plan_key, txn_id=txn_id)
+        await call.message.edit_text(
+            "❌ <b>Платёж отменён или истёк.</b>\n\nВернись назад и создай новый счёт.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data=f"buy_crypto:{plan_key}")],
+                [InlineKeyboardButton(text="🔙 Назад",        callback_data="subscription")],
+            ]),
+        )
+    else:  # PENDING
+        log_event("CRYPTO_PENDING", tg_id, uname, plan=plan_key, txn_id=txn_id)
+        await call.message.edit_text(
+            f"⏳ <b>Ожидание оплаты...</b>\n\n"
+            "Крипто-переводы могут подтверждаться 1–5 минут.\n\n"
+            f"<i>ID: <code>{txn_id}</code></i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🔄 Проверить снова",
+                    callback_data=f"check_crypto:{txn_id}:{plan_key}",
+                )],
+                [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data=f"buy_crypto:{plan_key}")],
+                [InlineKeyboardButton(text="📩 Поддержка",    url="https://t.me/selftabs_support")],
+                [InlineKeyboardButton(text="🔙 Назад",        callback_data="subscription")],
+            ]),
         )
 
 
@@ -1572,8 +2098,7 @@ async def admin_view_profile_handle(message: Message, state: FSMContext):
         return
     text = message.text.strip() if message.text else ""
     if not text.lstrip("-").isdigit():
-        await message.answer("⚠️ Введи корректный числовой Telegram ID.",
-                             reply_markup=get_admin_cancel_keyboard())
+        await message.answer("⚠️ Введи корректный числовой Telegram ID.", reply_markup=get_admin_cancel_keyboard())
         return
 
     target_id = int(text)
@@ -1589,19 +2114,11 @@ async def admin_view_profile_handle(message: Message, state: FSMContext):
         return
 
     status, user = await api_get("/me", token)
-
     if status == 401:
-        await message.answer(
-            f"⚠️ Сессия пользователя <code>{target_id}</code> истекла.",
-            reply_markup=get_admin_keyboard(),
-        )
+        await message.answer(f"⚠️ Сессия пользователя <code>{target_id}</code> истекла.", reply_markup=get_admin_keyboard())
         return
-
     if status != 200:
-        await message.answer(
-            f"❌ Не удалось загрузить профиль (HTTP {status}).",
-            reply_markup=get_admin_keyboard(),
-        )
+        await message.answer(f"❌ Не удалось загрузить профиль (HTTP {status}).", reply_markup=get_admin_keyboard())
         return
 
     integrations = user.get("integrations", {})
@@ -1665,8 +2182,7 @@ async def admin_grant_sub_user_handle(message: Message, state: FSMContext):
         return
     text = message.text.strip() if message.text else ""
     if not text.lstrip("-").isdigit():
-        await message.answer("⚠️ Введи корректный числовой Telegram ID.",
-                             reply_markup=get_admin_cancel_keyboard())
+        await message.answer("⚠️ Введи корректный числовой Telegram ID.", reply_markup=get_admin_cancel_keyboard())
         return
 
     target_id = int(text)
@@ -1728,8 +2244,7 @@ async def admin_sub_days_handle(message: Message, state: FSMContext):
         return
     text = message.text.strip() if message.text else ""
     if not text.isdigit() or int(text) <= 0:
-        await message.answer("⚠️ Введи целое положительное число дней.",
-                             reply_markup=get_admin_cancel_keyboard())
+        await message.answer("⚠️ Введи целое положительное число дней.", reply_markup=get_admin_cancel_keyboard())
         return
     data      = await state.get_data()
     target_id = data.get("target_tg_id")
@@ -1739,8 +2254,7 @@ async def admin_sub_days_handle(message: Message, state: FSMContext):
     await _admin_apply_sub_message(message, target_id, plan_key, days)
 
 
-async def _admin_apply_subscription(call: CallbackQuery, state: FSMContext,
-                                    target_id: int, plan_key: str, days: int):
+async def _admin_apply_subscription(call: CallbackQuery, state: FSMContext, target_id: int, plan_key: str, days: int):
     await state.clear()
     await call.answer("⏳ Применяю...")
     success, result_text = await _do_grant_subscription(target_id, plan_key, days)
@@ -1752,8 +2266,7 @@ async def _admin_apply_subscription(call: CallbackQuery, state: FSMContext,
     )
 
 
-async def _admin_apply_sub_message(message: Message, target_id: int,
-                                   plan_key: str, days: int):
+async def _admin_apply_sub_message(message: Message, target_id: int, plan_key: str, days: int):
     success, result_text = await _do_grant_subscription(target_id, plan_key, days)
     await message.answer(
         result_text,
@@ -1763,23 +2276,18 @@ async def _admin_apply_sub_message(message: Message, target_id: int,
     )
 
 
-async def _do_grant_subscription(target_tg_id: int, plan_key: str,
-                                 days: int) -> tuple[bool, str]:
+async def _do_grant_subscription(target_tg_id: int, plan_key: str, days: int) -> tuple[bool, str]:
     plan_emoji, plan_name = PLAN_NAMES.get(plan_key, ("🆓", plan_key))
     try:
         headers = {"Content-Type": "application/json", "X-Bot-Secret": BOT_SECRET}
         payload = {"telegram_id": target_tg_id, "plan": plan_key, "days": days}
         async with aiohttp.ClientSession() as session:
-            async with session.post(f"{API_URL}/admin/subscription",
-                                    json=payload, headers=headers) as r:
+            async with session.post(f"{API_URL}/admin/subscription", json=payload, headers=headers) as r:
                 try:
                     resp = await r.json()
                 except Exception:
                     resp = {}
                 http_status = r.status
-
-        logger.info(f"[ADMIN_GRANT] target={target_tg_id} plan={plan_key} days={days} "
-                    f"http={http_status} resp={resp}")
 
         if http_status in (200, 201):
             if plan_key == "standard":
@@ -1798,7 +2306,7 @@ async def _do_grant_subscription(target_tg_id: int, plan_key: str,
                     f"⏳ До: <b>{expires_at}</b>"
                 )
             try:
-                notify_text = (
+                user_notify_text = (
                     "ℹ️ <b>Ваша подписка была изменена администратором.</b>\n\n"
                     "Текущий тариф: 🆓 <b>Self Free</b>"
                     if plan_key == "standard" else
@@ -1807,12 +2315,11 @@ async def _do_grant_subscription(target_tg_id: int, plan_key: str,
                     f"📅 Активна: <b>{days} дней</b>\n\n"
                     "Приятного использования Selftabs! 🚀"
                 )
-                await bot.send_message(target_tg_id, notify_text)
+                await bot.send_message(target_tg_id, user_notify_text)
             except Exception as e:
                 logger.warning(f"[ADMIN_GRANT] не удалось уведомить {target_tg_id}: {e}")
                 text += "\n\n⚠️ <i>Не удалось отправить уведомление пользователю.</i>"
             return True, text
-
         else:
             detail = resp.get("detail", str(resp))
             return False, (
@@ -1820,7 +2327,6 @@ async def _do_grant_subscription(target_tg_id: int, plan_key: str,
                 f"👤 Пользователь: <code>{target_tg_id}</code>\n"
                 f"Детали: <code>{detail}</code>"
             )
-
     except Exception as e:
         logger.error(f"[ADMIN_GRANT] exception target={target_tg_id}: {e}")
         return False, f"❌ <b>Исключение при запросе к API:</b>\n<code>{str(e)[:300]}</code>"
@@ -1837,37 +2343,30 @@ def _local_now() -> datetime:
 
 async def _safe_send(tg_id: int, text: str, reply_markup=None):
     try:
-        await bot.send_message(
-            chat_id=tg_id, text=text,
-            parse_mode="HTML", reply_markup=reply_markup,
-        )
+        await bot.send_message(chat_id=tg_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
     except Exception as e:
         logging.warning(f"[scheduler] не удалось отправить {tg_id}: {e}")
 
 
 async def check_subscription_expiry():
     now = datetime.now(timezone.utc)
-
     for tg_id, token in user_tokens.items():
         try:
             status, user = await api_get("/me", token)
         except Exception:
             continue
-
         if status != 200:
             if status == 401:
-                await user_tokens.pop(tg_id)
+                user_tokens.pop(tg_id, None)
             continue
 
         plan_key    = user.get("subscription_plan", "standard")
         expires_raw = user.get("subscription_expires_at")
-
         if plan_key == "standard" or not expires_raw:
             continue
 
         try:
-            expires_str = expires_raw.replace("Z", "+00:00")
-            expires_at  = datetime.fromisoformat(expires_str)
+            expires_at = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
             if expires_at.tzinfo is None:
                 expires_at = expires_at.replace(tzinfo=timezone.utc)
         except Exception:
@@ -1885,42 +2384,33 @@ async def check_subscription_expiry():
 
         if 604800 >= total_secs > 600800:
             key = "sub_7d"
-            if not await notif_log.already_sent(tg_id, key, date_tag):
-                await _safe_send(
-                    tg_id,
+            if not notif_log.already_sent(tg_id, key, date_tag):
+                await _safe_send(tg_id,
                     f"🔔 <b>Подписка истекает через 7 дней</b>\n\n"
                     f"{plan_emoji} Тариф: <b>{plan_name}</b>\n"
                     f"📅 Истекает: <b>{exp_fmt}</b>\n\n"
-                    "Продли заранее — доступ не прервётся 👇",
-                    renew_kb,
-                )
-                await notif_log.mark_sent(tg_id, key, date_tag)
+                    "Продли заранее — доступ не прервётся 👇", renew_kb)
+                notif_log.mark_sent(tg_id, key, date_tag)
 
         elif 86400 >= total_secs > 82800:
             key = "sub_1d"
-            if not await notif_log.already_sent(tg_id, key, date_tag):
-                await _safe_send(
-                    tg_id,
+            if not notif_log.already_sent(tg_id, key, date_tag):
+                await _safe_send(tg_id,
                     f"⚠️ <b>Подписка истекает завтра!</b>\n\n"
                     f"{plan_emoji} Тариф: <b>{plan_name}</b>\n"
                     f"📅 Истекает: <b>{exp_fmt}</b>\n\n"
-                    "Продли сейчас, чтобы не потерять доступ 👇",
-                    renew_kb,
-                )
-                await notif_log.mark_sent(tg_id, key, date_tag)
+                    "Продли сейчас, чтобы не потерять доступ 👇", renew_kb)
+                notif_log.mark_sent(tg_id, key, date_tag)
 
         elif 7200 >= total_secs > 6300:
             key = "sub_2h"
-            if not await notif_log.already_sent(tg_id, key, date_tag):
-                await _safe_send(
-                    tg_id,
+            if not notif_log.already_sent(tg_id, key, date_tag):
+                await _safe_send(tg_id,
                     f"🚨 <b>Подписка истекает менее чем через 2 часа!</b>\n\n"
                     f"{plan_emoji} Тариф: <b>{plan_name}</b>\n"
                     f"📅 Истекает: <b>{exp_fmt}</b>\n\n"
-                    "Продли прямо сейчас — ещё не поздно 👇",
-                    renew_kb,
-                )
-                await notif_log.mark_sent(tg_id, key, date_tag)
+                    "Продли прямо сейчас — ещё не поздно 👇", renew_kb)
+                notif_log.mark_sent(tg_id, key, date_tag)
 
 
 async def expiry_scheduler():
@@ -1945,11 +2435,10 @@ async def send_daily_digest():
         plan_key = user.get("subscription_plan", "standard")
         if plan_key not in ("pro", "team"):
             continue
-        if await notif_log.already_sent(tg_id, "daily", today_tag):
+        if notif_log.already_sent(tg_id, "daily", today_tag):
             continue
         plan_emoji, plan_name = PLAN_NAMES[plan_key]
-        await _safe_send(
-            tg_id,
+        await _safe_send(tg_id,
             f"📰 <b>Твой ежедневный дайджест готов!</b>\n\n"
             f"{plan_emoji} Тариф: <b>{plan_name}</b>\n\n"
             "Selftabs собрал для тебя ключевые обновления по твоим темам 🧠\n\n"
@@ -1958,7 +2447,7 @@ async def send_daily_digest():
                 InlineKeyboardButton(text="📖 Открыть дайджест", url="https://selftabs.com/digest")
             ]]),
         )
-        await notif_log.mark_sent(tg_id, "daily", today_tag)
+        notif_log.mark_sent(tg_id, "daily", today_tag)
         await asyncio.sleep(0.05)
 
 
@@ -1974,11 +2463,10 @@ async def send_weekly_digest():
         plan_key = user.get("subscription_plan", "standard")
         if plan_key not in ("pro", "team"):
             continue
-        if await notif_log.already_sent(tg_id, "weekly", today_tag):
+        if notif_log.already_sent(tg_id, "weekly", today_tag):
             continue
         plan_emoji, plan_name = PLAN_NAMES[plan_key]
-        await _safe_send(
-            tg_id,
+        await _safe_send(tg_id,
             f"📊 <b>Еженедельный AI-дайджест готов!</b>\n\n"
             f"{plan_emoji} Тариф: <b>{plan_name}</b>\n\n"
             "Selftabs подготовил сводку за прошедшую неделю:\n"
@@ -1987,11 +2475,10 @@ async def send_weekly_digest():
             "• 🧠 AI-выводы по твоим интересам\n\n"
             "Открой расширение, чтобы прочитать полный отчёт 👇",
             InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="📖 Открыть weekly-дайджест",
-                                     url="https://selftabs.com/digest/weekly")
+                InlineKeyboardButton(text="📖 Открыть weekly-дайджест", url="https://selftabs.com/digest/weekly")
             ]]),
         )
-        await notif_log.mark_sent(tg_id, "weekly", today_tag)
+        notif_log.mark_sent(tg_id, "weekly", today_tag)
         await asyncio.sleep(0.05)
 
 
@@ -2003,8 +2490,7 @@ async def digest_scheduler():
         if now_local >= target:
             target += timedelta(days=1)
         sleep_secs = (target - now_local).total_seconds()
-        logging.info(f"[scheduler] следующий дайджест через {sleep_secs/3600:.1f} ч "
-                     f"({target.strftime('%d.%m %H:%M')})")
+        logging.info(f"[scheduler] следующий дайджест через {sleep_secs/3600:.1f} ч ({target.strftime('%d.%m %H:%M')})")
         await asyncio.sleep(sleep_secs)
 
         try:
@@ -2019,45 +2505,23 @@ async def digest_scheduler():
                 logging.error(f"[scheduler] ошибка weekly digest: {e}")
 
         try:
-            await notif_log.cleanup_old()
+            notif_log.cleanup_old()
         except Exception:
             pass
 
         await asyncio.sleep(60)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# HEALTHCHECK — чтобы Render видел живой HTTP-сервис
-# ══════════════════════════════════════════════════════════════════════════
+# ── Запуск ────────────────────────────────────────────────────────────────
 
-async def health_handler(request: web.Request) -> web.Response:
-    return web.Response(text="ok")
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# ЗАПУСК (webhook + aiohttp)
-# ══════════════════════════════════════════════════════════════════════════
-
-async def on_startup(app: web.Application):
+async def main():
     global crypto
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # ── PostgreSQL (Supabase) ──────────────────────────────────────────────
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL не задан — укажи переменную окружения")
-
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    app["db_pool"] = pool
-
-    await user_tokens.init(pool)
-    await notif_log.init(pool)
-
-    # ── CryptoPay ─────────────────────────────────────────────────────────
     if CRYPTO_PAY_TOKEN:
         crypto = AioCryptoPay(token=CRYPTO_PAY_TOKEN, network=CRYPTO_NETWORK)
         try:
@@ -2068,56 +2532,30 @@ async def on_startup(app: web.Application):
     else:
         logging.warning("⚠️ CRYPTO_PAY_TOKEN не задан — крипто-оплата недоступна")
 
-    # ── Webhook ───────────────────────────────────────────────────────────
-    webhook_full_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-    await bot.set_webhook(
-        url=webhook_full_url,
-        drop_pending_updates=True,
-        allowed_updates=dp.resolve_used_update_types(),
-    )
-    logging.info(f"✅ Webhook установлен: {webhook_full_url}")
+    print("=" * 50)
+    print("🚀 SELFTABS БОТ ЗАПУЩЕН")
+    print("=" * 50)
+    print(f"🌐 API_URL: {API_URL}")
+    print(f"📋 Планы: {list(PLANS.keys())}")
+    print(f"🏦 СБП (Platega): {'✅' if PLATEGA_BOT_SECRET else '❌ BOT_SECRET не задан'}")
+    print(f"🪙 Крипта (Platega): {'✅' if PLATEGA_BOT_SECRET else '❌ BOT_SECRET не задан'}")
+    print(f"📧 Email-авторизация: ✅")
+    print("=" * 50)
 
-    # ── Фоновые задачи ────────────────────────────────────────────────────
+    await bot.delete_webhook(drop_pending_updates=True)
+
     asyncio.create_task(expiry_scheduler())
     asyncio.create_task(digest_scheduler())
 
-    print("=" * 50)
-    print("🚀 SELFTABS БОТ ЗАПУЩЕН (webhook)")
-    print("=" * 50)
-    print(f"🌐 API_URL:     {API_URL}")
-    print(f"🔗 WEBHOOK_URL: {webhook_full_url}")
-    print(f"🏦 СБП:         {'✅' if ROBOKASSA_LOGIN else '❌ не настроен'}")
-    print(f"🪙 CryptoPay:   {'✅' if CRYPTO_PAY_TOKEN else '❌ не настроен'}")
-    print("=" * 50)
-
-
-async def on_shutdown(app: web.Application):
-    await bot.delete_webhook()
-    if crypto:
-        await crypto.close()
-    pool = app.get("db_pool")
-    if pool:
-        await pool.close()
-    logging.info("Бот остановлен.")
-
-
-def main():
-    app = web.Application()
-
-    # Регистрируем webhook-роут для Telegram
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-
-    # Healthcheck для Render (и UptimeRobot при желании)
-    app.router.add_get("/health", health_handler)
-    app.router.add_get("/", health_handler)
-
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-
-    setup_application(app, dp, bot=bot)
-
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if crypto:
+            await crypto.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n❌ Бот остановлен")
