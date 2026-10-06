@@ -23,6 +23,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from dotenv import load_dotenv
 import aiohttp
+from aiohttp import web
 from aiohttp_socks import ProxyConnector
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
@@ -2532,6 +2533,23 @@ async def main():
     else:
         logging.warning("⚠️ CRYPTO_PAY_TOKEN не задан — крипто-оплата недоступна")
 
+    # ── Health-check HTTP-сервер для Render ───────────────────────────────
+    async def _health(request):
+        return web.Response(text="OK")
+
+    _app = web.Application()
+    _app.router.add_get("/",       _health)
+    _app.router.add_get("/health", _health)
+
+    _runner = web.AppRunner(_app)
+    await _runner.setup()
+
+    port = int(os.getenv("PORT", 10000))
+    _site = web.TCPSite(_runner, "0.0.0.0", port)
+    await _site.start()
+    logging.info(f"✅ Health-check сервер запущен на порту {port}")
+    # ─────────────────────────────────────────────────────────────────────
+
     print("=" * 50)
     print("🚀 SELFTABS БОТ ЗАПУЩЕН")
     print("=" * 50)
@@ -2547,11 +2565,36 @@ async def main():
     asyncio.create_task(expiry_scheduler())
     asyncio.create_task(digest_scheduler())
 
+    # ── Graceful shutdown при SIGTERM (Render останавливает именно так) ───
+    import signal
+    loop       = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _handle_sigterm():
+        logging.info("SIGTERM получен — начинаем graceful shutdown")
+        stop_event.set()
+
+    loop.add_signal_handler(signal.SIGTERM, _handle_sigterm)
+    loop.add_signal_handler(signal.SIGINT,  _handle_sigterm)
+    # ─────────────────────────────────────────────────────────────────────
+
+    polling_task = asyncio.create_task(dp.start_polling(bot))
+    await stop_event.wait()
+
+    logging.info("Останавливаем polling...")
+    polling_task.cancel()
     try:
-        await dp.start_polling(bot)
-    finally:
-        if crypto:
-            await crypto.close()
+        await polling_task
+    except asyncio.CancelledError:
+        pass
+
+    if crypto:
+        await crypto.close()
+
+    await dp.storage.close()
+    await bot.session.close()
+    await _runner.cleanup()
+    logging.info("✅ Бот остановлен чисто")
 
 
 if __name__ == "__main__":
